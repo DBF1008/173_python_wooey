@@ -105,6 +105,26 @@ wooey_patterns = [
         name="api_job_details",
     ),
     re_path(
+        r"^api/jobs/v1/(?P<job_id>[a-zA-Z0-9\-\_]+)/stop/$",
+        api.stop_job,
+        name="api_job_stop",
+    ),
+    re_path(
+        r"^api/jobs/v1/(?P<job_id>[a-zA-Z0-9\-\_]+)/rerun/$",
+        api.rerun_job,
+        name="api_job_rerun",
+    ),
+    re_path(
+        r"^api/jobs/v1/(?P<job_id>[a-zA-Z0-9\-\_]+)/resubmit/$",
+        api.resubmit_job,
+        name="api_job_resubmit",
+    ),
+    re_path(
+        r"^api/jobs/v1/(?P<job_id>[a-zA-Z0-9\-\_]+)/delete/$",
+        api.delete_job,
+        name="api_job_delete",
+    ),
+    re_path(
         r"^scripts/(?P<slug>[a-zA-Z0-9\-\_]+)/$",
         views.WooeyScriptView.as_view(),
         name="wooey_script",

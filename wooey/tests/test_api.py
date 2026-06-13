@@ -2,6 +2,7 @@ import json
 import os
 from io import BytesIO
 
+from celery import states
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import Client, TransactionTestCase
 from django.urls import reverse
@@ -782,3 +783,260 @@ class TestScriptSubmission(
             ),
             [1, 2, 3],
         )
+
+
+class TestJobStop(mixins.ScriptFactoryMixin, ApiTestMixin, TransactionTestCase):
+    def test_stop_requires_authentication(self):
+        job = factories.generate_job(self.translate_script)
+        response = Client().post(
+            reverse("wooey:api_job_stop", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.json()["valid"])
+
+    def test_stop_requires_ownership(self):
+        another_user = factories.UserFactory(username="bob")
+        job = factories.generate_job(self.translate_script)
+        job.user = another_user
+        job.save()
+        response = self.client.post(
+            reverse("wooey:api_job_stop", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.json()["valid"])
+
+    def test_stop_running_job(self):
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.RUNNING
+        job.save()
+        response = self.client.post(
+            reverse("wooey:api_job_stop", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+        self.assertEqual(data["status"], states.REVOKED)
+        job.refresh_from_db()
+        self.assertEqual(job.status, states.REVOKED)
+
+    def test_stop_submitted_job(self):
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.SUBMITTED
+        job.save()
+        response = self.client.post(
+            reverse("wooey:api_job_stop", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+        self.assertEqual(data["status"], states.REVOKED)
+
+    def test_cannot_stop_completed_job(self):
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.COMPLETED
+        job.save()
+        response = self.client.post(
+            reverse("wooey:api_job_stop", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(response.json()["valid"])
+
+    def test_cannot_stop_deleted_job(self):
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.DELETED
+        job.save()
+        response = self.client.post(
+            reverse("wooey:api_job_stop", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(response.json()["valid"])
+
+
+class TestJobRerun(mixins.ScriptFactoryMixin, ApiTestMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        self.api_key.profile.user.is_staff = False
+        self.api_key.profile.user.save()
+
+    def test_rerun_requires_authentication(self):
+        job = factories.generate_job(self.translate_script)
+        response = Client().post(
+            reverse("wooey:api_job_rerun", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.json()["valid"])
+
+    def test_rerun_requires_ownership(self):
+        another_user = factories.UserFactory(username="bob")
+        job = factories.generate_job(self.translate_script)
+        job.user = another_user
+        job.save()
+        response = self.client.post(
+            reverse("wooey:api_job_rerun", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.json()["valid"])
+
+    def test_rerun_completed_job(self):
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.COMPLETED
+        job.save()
+        response = self.client.post(
+            reverse("wooey:api_job_rerun", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+        self.assertEqual(data["job_id"], job.id)
+        # submit_to_celery(rerun=True) is invoked; resulting status depends
+        # on execution environment (sync in tests, async in production)
+
+    def test_rerun_failed_job(self):
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.FAILED
+        job.save()
+        response = self.client.post(
+            reverse("wooey:api_job_rerun", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+        self.assertEqual(data["job_id"], job.id)
+
+    def test_rerun_revoked_job(self):
+        job = factories.generate_job(self.translate_script)
+        job.status = states.REVOKED
+        job.save()
+        response = self.client.post(
+            reverse("wooey:api_job_rerun", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+        self.assertEqual(data["job_id"], job.id)
+
+    def test_cannot_rerun_running_job(self):
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.RUNNING
+        job.save()
+        response = self.client.post(
+            reverse("wooey:api_job_rerun", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(response.json()["valid"])
+
+    def test_cannot_rerun_deleted_job(self):
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.DELETED
+        job.save()
+        response = self.client.post(
+            reverse("wooey:api_job_rerun", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(response.json()["valid"])
+
+
+class TestJobResubmit(
+    mixins.ScriptFactoryMixin, ApiTestMixin, TransactionTestCase
+):
+    def test_resubmit_requires_authentication(self):
+        job = factories.generate_job(self.translate_script)
+        response = Client().post(
+            reverse("wooey:api_job_resubmit", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.json()["valid"])
+
+    def test_resubmit_requires_ownership(self):
+        another_user = factories.UserFactory(username="bob")
+        job = factories.generate_job(self.translate_script)
+        job.user = another_user
+        job.save()
+        response = self.client.post(
+            reverse("wooey:api_job_resubmit", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.json()["valid"])
+
+    def test_resubmit_creates_new_job(self):
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.COMPLETED
+        job.save()
+        original_id = job.id
+        response = self.client.post(
+            reverse("wooey:api_job_resubmit", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+        self.assertNotEqual(data["job_id"], original_id)
+        self.assertEqual(data["original_job_id"], original_id)
+        # Original job should be unchanged
+        original_job = WooeyJob.objects.get(id=original_id)
+        self.assertEqual(original_job.status, WooeyJob.COMPLETED)
+
+    def test_resubmit_running_job(self):
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.RUNNING
+        job.save()
+        original_id = job.id
+        response = self.client.post(
+            reverse("wooey:api_job_resubmit", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+        self.assertNotEqual(data["job_id"], original_id)
+
+    def test_cannot_resubmit_deleted_job(self):
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.DELETED
+        job.save()
+        response = self.client.post(
+            reverse("wooey:api_job_resubmit", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(response.json()["valid"])
+
+
+class TestJobDelete(mixins.ScriptFactoryMixin, ApiTestMixin, TransactionTestCase):
+    def test_delete_requires_authentication(self):
+        job = factories.generate_job(self.translate_script)
+        response = Client().post(
+            reverse("wooey:api_job_delete", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.json()["valid"])
+
+    def test_delete_requires_ownership(self):
+        another_user = factories.UserFactory(username="bob")
+        job = factories.generate_job(self.translate_script)
+        job.user = another_user
+        job.save()
+        response = self.client.post(
+            reverse("wooey:api_job_delete", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.json()["valid"])
+
+    def test_delete_job(self):
+        job = factories.generate_job(self.translate_script)
+        response = self.client.post(
+            reverse("wooey:api_job_delete", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+        self.assertEqual(data["status"], WooeyJob.DELETED)
+        job.refresh_from_db()
+        self.assertEqual(job.status, WooeyJob.DELETED)
+
+    def test_cannot_delete_already_deleted_job(self):
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.DELETED
+        job.save()
+        response = self.client.post(
+            reverse("wooey:api_job_delete", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(response.json()["valid"])

@@ -1,6 +1,10 @@
 from .jobs import (  # noqa: F401
+    delete_job,
     job_details,
     job_status,
+    rerun_job,
+    resubmit_job,
+    stop_job,
 )
 from .scripts import (  # noqa: F401
     add_or_update_script,
