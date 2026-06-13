@@ -80,6 +80,11 @@ wooey_patterns = [
         name="api_patch_virtual_environment",
     ),
     re_path(
+        r"^api/virtual-environments/v1/(?P<virtual_environment_id>\d+)/diagnostics/$",
+        api.diagnostics_virtual_environment,
+        name="api_diagnostics_virtual_environment",
+    ),
+    re_path(
         r"^api/scripts/v1/(?P<slug>[a-zA-Z0-9\-\_]+)/$",
         api.script_detail,
         name="api_script_detail",

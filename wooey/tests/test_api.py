@@ -1,5 +1,7 @@
 import json
 import os
+import shutil
+import tempfile
 from io import BytesIO
 
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -610,6 +612,158 @@ class TestVirtualEnvironmentManagementApi(ApiTestMixin, TransactionTestCase):
         )
         self.assertEqual(virtual_environment.name, "updated-venv")
         self.assertEqual(virtual_environment.python_binary, "/usr/bin/python3.11")
+
+
+class TestVirtualEnvironmentDiagnosticsApi(ApiTestMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        self.venv_directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.venv_directory, ignore_errors=True)
+
+    def _create_virtual_environment(self, **overrides):
+        params = {
+            "name": "diagnostics-venv",
+            "python_binary": "/usr/bin/python3",
+            "venv_directory": self.venv_directory,
+        }
+        params.update(overrides)
+        return factories.VirtualEnvFactory(**params)
+
+    def _diagnostics_url(self, virtual_environment_id):
+        return reverse(
+            "wooey:api_diagnostics_virtual_environment",
+            kwargs={"virtual_environment_id": virtual_environment_id},
+        )
+
+    def test_diagnostics_requires_staff(self):
+        virtual_environment = self._create_virtual_environment()
+        response = self.client.get(self._diagnostics_url(virtual_environment.id))
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.json()["valid"])
+
+    def test_diagnostics_returns_404_for_unknown_environment(self):
+        self.make_staff()
+        response = self.client.get(self._diagnostics_url(999999))
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(response.json()["valid"])
+
+    def test_diagnostics_for_empty_environment(self):
+        self.make_staff()
+        virtual_environment = self._create_virtual_environment(requirements="django")
+
+        response = self.client.get(self._diagnostics_url(virtual_environment.id))
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["virtual_environment"]
+        self.assertFalse(data["installed"])
+        self.assertEqual(data["bound_scripts"], [])
+        self.assertEqual(
+            data["python_executable"], virtual_environment.get_venv_python_binary()
+        )
+        self.assertEqual(data["install_path"], virtual_environment.get_install_path())
+        # Key configuration summary travels with the diagnostics payload.
+        self.assertEqual(data["name"], "diagnostics-venv")
+        self.assertEqual(data["python_binary"], "/usr/bin/python3")
+        self.assertEqual(data["requirements"], "django")
+        self.assertEqual(data["venv_directory"], self.venv_directory)
+
+    def test_diagnostics_lists_bound_scripts(self):
+        self.make_staff()
+        virtual_environment = self._create_virtual_environment()
+        first_script = factories.ScriptFactory(
+            script_name="alpha-script", virtual_environment=virtual_environment
+        )
+        second_script = factories.ScriptFactory(
+            script_name="beta-script", virtual_environment=virtual_environment
+        )
+        # A script bound to a different environment must not leak in.
+        other_environment = self._create_virtual_environment(name="other-venv")
+        factories.ScriptFactory(
+            script_name="unrelated-script", virtual_environment=other_environment
+        )
+
+        response = self.client.get(self._diagnostics_url(virtual_environment.id))
+
+        data = response.json()["virtual_environment"]
+        bound_scripts = data["bound_scripts"]
+        self.assertEqual(
+            [entry["name"] for entry in bound_scripts],
+            ["alpha-script", "beta-script"],
+        )
+        self.assertEqual(bound_scripts[0]["id"], first_script.id)
+        self.assertEqual(bound_scripts[0]["slug"], first_script.slug)
+        self.assertEqual(bound_scripts[1]["id"], second_script.id)
+        self.assertEqual(bound_scripts[1]["slug"], second_script.slug)
+
+    def test_diagnostics_reflect_configuration_updates(self):
+        self.make_staff()
+        virtual_environment = self._create_virtual_environment(requirements="django")
+
+        patch_response = self.client.generic(
+            "PATCH",
+            reverse(
+                "wooey:api_patch_virtual_environment",
+                kwargs={"virtual_environment_id": virtual_environment.id},
+            ),
+            data=json.dumps(
+                {
+                    "python_binary": "/usr/bin/python3.11",
+                    "requirements": "flask",
+                }
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(patch_response.status_code, 200)
+        # The patch response exposes the same diagnostics shape as the query.
+        patched = patch_response.json()["virtual_environment"]
+        self.assertIn("installed", patched)
+        self.assertIn("bound_scripts", patched)
+        self.assertEqual(patched["python_binary"], "/usr/bin/python3.11")
+        self.assertEqual(patched["requirements"], "flask")
+
+        response = self.client.get(self._diagnostics_url(virtual_environment.id))
+        data = response.json()["virtual_environment"]
+        virtual_environment.refresh_from_db()
+        self.assertEqual(data["python_binary"], "/usr/bin/python3.11")
+        self.assertEqual(data["requirements"], "flask")
+        # Path-affecting config changes are reflected in the resolved paths.
+        self.assertEqual(data["install_path"], virtual_environment.get_install_path())
+        self.assertEqual(
+            data["python_executable"], virtual_environment.get_venv_python_binary()
+        )
+
+    def test_diagnostics_for_uninitialized_directory(self):
+        self.make_staff()
+        virtual_environment = self._create_virtual_environment(
+            venv_directory=os.path.join(self.venv_directory, "missing")
+        )
+
+        response = self.client.get(self._diagnostics_url(virtual_environment.id))
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()["virtual_environment"]
+        self.assertFalse(data["installed"])
+        # Even without an initialized directory the metadata stays usable.
+        self.assertEqual(
+            data["python_executable"], virtual_environment.get_venv_python_binary()
+        )
+        self.assertEqual(data["install_path"], virtual_environment.get_install_path())
+        self.assertFalse(os.path.exists(data["install_path"]))
+
+    def test_diagnostics_reports_installed_environment(self):
+        self.make_staff()
+        virtual_environment = self._create_virtual_environment()
+        executable = virtual_environment.get_venv_python_binary()
+        os.makedirs(os.path.dirname(executable), exist_ok=True)
+        with open(executable, "w"):
+            pass
+
+        response = self.client.get(self._diagnostics_url(virtual_environment.id))
+
+        data = response.json()["virtual_environment"]
+        self.assertTrue(data["installed"])
+        self.assertEqual(data["python_executable"], executable)
 
 
 class TestScriptSubmission(

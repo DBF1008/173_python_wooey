@@ -1,3 +1,5 @@
+import os
+
 from django.http import JsonResponse
 from django.utils.encoding import force_str
 from django.utils.translation import gettext_lazy as _
@@ -18,6 +20,28 @@ def _serialize_virtual_environment(virtual_environment):
         "venv_directory": virtual_environment.venv_directory,
         "install_path": virtual_environment.get_install_path(),
     }
+
+
+def _serialize_virtual_environment_diagnostics(virtual_environment):
+    data = _serialize_virtual_environment(virtual_environment)
+    python_executable = virtual_environment.get_venv_python_binary()
+    data.update(
+        {
+            "installed": os.path.exists(python_executable),
+            "python_executable": python_executable,
+            "bound_scripts": [
+                {
+                    "id": script.id,
+                    "name": script.script_name,
+                    "slug": script.slug,
+                }
+                for script in virtual_environment.script_set.order_by(
+                    "script_name", "pk"
+                )
+            ],
+        }
+    )
+    return data
 
 
 def _get_virtual_environment_or_error(virtual_environment_id):
@@ -68,7 +92,9 @@ def create_virtual_environment(request):
     return JsonResponse(
         {
             "valid": True,
-            "virtual_environment": _serialize_virtual_environment(virtual_environment),
+            "virtual_environment": _serialize_virtual_environment_diagnostics(
+                virtual_environment
+            ),
         }
     )
 
@@ -94,6 +120,28 @@ def patch_virtual_environment(request, virtual_environment_id):
     return JsonResponse(
         {
             "valid": True,
-            "virtual_environment": _serialize_virtual_environment(virtual_environment),
+            "virtual_environment": _serialize_virtual_environment_diagnostics(
+                virtual_environment
+            ),
+        }
+    )
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+@requires_staff
+def diagnostics_virtual_environment(request, virtual_environment_id):
+    virtual_environment, error = _get_virtual_environment_or_error(
+        virtual_environment_id
+    )
+    if error:
+        return error
+
+    return JsonResponse(
+        {
+            "valid": True,
+            "virtual_environment": _serialize_virtual_environment_diagnostics(
+                virtual_environment
+            ),
         }
     )
