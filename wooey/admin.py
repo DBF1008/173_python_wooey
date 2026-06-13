@@ -2,6 +2,7 @@ from __future__ import absolute_import
 import os
 
 from django.contrib.admin import ModelAdmin, site, TabularInline
+from django.utils.html import format_html
 
 from .models import (
     Script,
@@ -125,11 +126,67 @@ class FileAdmin(ModelAdmin):
 
 
 class VirtualEnvironmentAdmin(ModelAdmin):
+    list_display = ("name", "python_binary", "installation_status_display")
+    readonly_fields = ("diagnostic_info_display",)
+    fieldsets = (
+        (
+            None,
+            {
+                "fields": (
+                    "name",
+                    "python_binary",
+                    "venv_directory",
+                    "requirements",
+                ),
+            },
+        ),
+        (
+            "Diagnostic",
+            {
+                "fields": ("diagnostic_info_display",),
+            },
+        ),
+    )
+
     def get_changeform_initial_data(self, request):
         return {
             "python_binary": VirtualEnvironment.get_default_python_binary(),
             "venv_directory": VirtualEnvironment.get_default_venv_directory(),
         }
+
+    def installation_status_display(self, obj):
+        info = obj.get_diagnostic_info()
+        if info["is_installed"]:
+            return format_html(
+                '<span style="color: green;">&#10003; Installed</span>'
+            )
+        return format_html(
+            '<span style="color: red;">&#10007; Not Installed</span>'
+        )
+
+    installation_status_display.short_description = "Status"
+
+    def diagnostic_info_display(self, obj):
+        info = obj.get_diagnostic_info()
+        scripts = (
+            ", ".join(info["bound_scripts"])
+            if info["bound_scripts"]
+            else "None"
+        )
+        lines = [
+            "Install Path: {}".format(info["install_path"]),
+            "Installed: {}".format("Yes" if info["is_installed"] else "No"),
+            "Executable: {}".format(info["executable_path"]),
+            "Executable Exists: {}".format(
+                "Yes" if info["executable_exists"] else "No"
+            ),
+            "Bound Scripts ({}): {}".format(
+                info["bound_scripts_count"], scripts
+            ),
+        ]
+        return "\n".join(lines)
+
+    diagnostic_info_display.short_description = "Diagnostic Info"
 
 
 site.register(WooeyWidget)

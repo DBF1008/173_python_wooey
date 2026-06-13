@@ -810,5 +810,28 @@ class VirtualEnvironment(models.Model):
             os.makedirs(path, exist_ok=True)
         return path
 
+    def get_diagnostic_info(self):
+        install_path = self.get_install_path()
+        executable_path = self.get_venv_python_binary()
+        is_installed = os.path.isdir(install_path)
+        executable_exists = os.path.isfile(executable_path)
+        bound_scripts = list(
+            self.script_set.filter(is_active=True)
+            .values_list("script_name", flat=True)
+            .order_by("script_name")
+        )
+        return {
+            "install_path": install_path,
+            "is_installed": is_installed,
+            "executable_path": executable_path,
+            "executable_exists": executable_exists,
+            "bound_scripts": bound_scripts,
+            "bound_scripts_count": len(bound_scripts),
+            "name": self.name,
+            "python_binary": self.python_binary,
+            "requirements": self.requirements or "",
+            "venv_directory": self.venv_directory,
+        }
+
     def __str__(self):
         return self.name

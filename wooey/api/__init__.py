@@ -12,6 +12,7 @@ from .scripts import (  # noqa: F401
 )
 from .virtual_envs import (  # noqa: F401
     create_virtual_environment,
+    diagnose_virtual_environment,
     list_virtual_environments,
     patch_virtual_environment,
 )

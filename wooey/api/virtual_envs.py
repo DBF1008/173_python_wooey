@@ -10,7 +10,7 @@ from .utils import get_submitted_data, requires_staff
 
 
 def _serialize_virtual_environment(virtual_environment):
-    return {
+    base = {
         "id": virtual_environment.id,
         "name": virtual_environment.name,
         "python_binary": virtual_environment.python_binary,
@@ -18,6 +18,17 @@ def _serialize_virtual_environment(virtual_environment):
         "venv_directory": virtual_environment.venv_directory,
         "install_path": virtual_environment.get_install_path(),
     }
+    diagnostic = virtual_environment.get_diagnostic_info()
+    base.update(
+        {
+            "is_installed": diagnostic["is_installed"],
+            "executable_path": diagnostic["executable_path"],
+            "executable_exists": diagnostic["executable_exists"],
+            "bound_scripts": diagnostic["bound_scripts"],
+            "bound_scripts_count": diagnostic["bound_scripts_count"],
+        }
+    )
+    return base
 
 
 def _get_virtual_environment_or_error(virtual_environment_id):
@@ -95,5 +106,22 @@ def patch_virtual_environment(request, virtual_environment_id):
         {
             "valid": True,
             "virtual_environment": _serialize_virtual_environment(virtual_environment),
+        }
+    )
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+@requires_staff
+def diagnose_virtual_environment(request, virtual_environment_id):
+    virtual_environment, error = _get_virtual_environment_or_error(
+        virtual_environment_id
+    )
+    if error:
+        return error
+    return JsonResponse(
+        {
+            "valid": True,
+            "diagnostic": virtual_environment.get_diagnostic_info(),
         }
     )
