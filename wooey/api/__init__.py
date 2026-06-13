@@ -8,6 +8,7 @@ from .scripts import (  # noqa: F401
     patch_script,
     patch_script_version,
     script_detail,
+    script_schema,
     submit_script,
 )
 from .virtual_envs import (  # noqa: F401

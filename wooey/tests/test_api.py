@@ -782,3 +782,262 @@ class TestScriptSubmission(
             ),
             [1, 2, 3],
         )
+
+
+class TestScriptSchema(mixins.ScriptFactoryMixin, ApiTestMixin, TransactionTestCase):
+    """Regression tests for the script_schema endpoint.
+
+    Coverage:
+    - No-param scripts (without_args.py)
+    - Regular parameters with defaults, choices and file fields (translate.py)
+    - Sub-parsers (subparser_script.py)
+    - Multi-file and multi-value scenarios (choices.py)
+    - Authentication, version filtering and error cases
+    """
+
+    def _get_schema(self, slug, **query):
+        url = reverse("wooey:api_script_schema", kwargs={"slug": slug})
+        if query:
+            url += "?" + "&".join(
+                "{}={}".format(k, v) for k, v in query.items()
+            )
+        return self.client.get(url)
+
+    # -- Authentication & error handling --------------------------------
+
+    def test_schema_requires_authentication(self):
+        response = Client().get(
+            reverse(
+                "wooey:api_script_schema",
+                kwargs={"slug": self.translate_script.script.slug},
+            )
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.json()["valid"])
+
+    def test_schema_returns_404_for_unknown_slug(self):
+        response = self._get_schema("does-not-exist")
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(response.json()["valid"])
+
+    def test_schema_returns_404_for_inactive_version(self):
+        self.translate_script.is_active = False
+        self.translate_script.save()
+        response = self._get_schema(self.translate_script.script.slug)
+        self.assertEqual(response.status_code, 404)
+
+    def test_schema_rejects_non_integer_iteration(self):
+        response = self._get_schema(
+            self.translate_script.script.slug, iteration="abc"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.json()["valid"])
+
+    # -- No-param script ------------------------------------------------
+
+    def test_schema_for_script_without_args(self):
+        response = self._get_schema(self.without_args.script.slug)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+        # Should have exactly one (main) parser with no parameters
+        parsers = data["parsers"]
+        self.assertEqual(len(parsers), 1)
+        self.assertIsNone(parsers[0]["name"])
+        self.assertTrue(parsers[0]["is_main"])
+        self.assertEqual(parsers[0]["parameters"], [])
+        # script_version block is populated
+        sv = data["script_version"]
+        self.assertEqual(sv["id"], self.without_args.pk)
+        self.assertTrue(sv["default_version"])
+
+    # -- Regular parameters (translate.py) ------------------------------
+
+    def test_schema_for_translate_script(self):
+        response = self._get_schema(self.translate_script.script.slug)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+
+        parsers = data["parsers"]
+        # translate.py has no subparsers — one main parser only
+        self.assertEqual(len(parsers), 1)
+        main_parser = parsers[0]
+        self.assertTrue(main_parser["is_main"])
+        self.assertIsNone(main_parser["name"])
+
+        params_by_slug = {p["slug"]: p for p in main_parser["parameters"]}
+
+        # -- frame has choices and a default
+        frame_param = params_by_slug["frame"]
+        self.assertFalse(frame_param["required"])
+        self.assertEqual(frame_param["default"], "+1")
+        self.assertIn("+1", frame_param["choices"])
+        self.assertIn("-3", frame_param["choices"])
+        # form_field stored as CharField but choices indicate it renders as a dropdown
+        self.assertIsNotNone(frame_param["choices"])
+
+        # -- fasta is a file input (not output)
+        fasta_param = params_by_slug["fasta"]
+        self.assertTrue(fasta_param["is_file"])
+        self.assertFalse(fasta_param["is_output"])
+        self.assertEqual(fasta_param["form_field"], "FileField")
+
+        # -- out is a file output
+        out_param = params_by_slug["out"]
+        self.assertTrue(out_param["is_output"])
+
+        # -- param_order is present and monotonically non-decreasing
+        orders = [p["param_order"] for p in main_parser["parameters"]]
+        self.assertEqual(orders, sorted(orders))
+
+    # -- Sub-parsers (subparser_script.py) ------------------------------
+
+    def test_schema_for_subparser_script(self):
+        response = self._get_schema(self.subparser_script.script.slug)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+
+        parsers = data["parsers"]
+        # Expect: main parser + subparser1 + subparser2 = 3 parsers
+        self.assertEqual(len(parsers), 3)
+
+        # First parser is the main parser
+        main = parsers[0]
+        self.assertTrue(main["is_main"])
+        self.assertIsNone(main["name"])
+        # --test-arg lives on the main parser
+        main_slugs = {p["slug"] for p in main["parameters"]}
+        self.assertIn("test_arg", main_slugs)
+
+        # Sub-parsers carry their own parameters
+        sp1 = next(p for p in parsers if p["name"] == "subparser1")
+        sp2 = next(p for p in parsers if p["name"] == "subparser2")
+        self.assertFalse(sp1["is_main"])
+        self.assertFalse(sp2["is_main"])
+
+        sp1_slugs = {p["slug"] for p in sp1["parameters"]}
+        sp2_slugs = {p["slug"] for p in sp2["parameters"]}
+        self.assertIn("sp1", sp1_slugs)
+        self.assertIn("sp2", sp2_slugs)
+        # sp1 and sp2 are required
+        self.assertTrue(
+            next(p for p in sp1["parameters"] if p["slug"] == "sp1")["required"]
+        )
+        self.assertTrue(
+            next(p for p in sp2["parameters"] if p["slug"] == "sp2")["required"]
+        )
+
+        # Each parser has a unique id
+        parser_ids = {p["id"] for p in parsers}
+        self.assertEqual(len(parser_ids), 3)
+
+    # -- Multi-file and multi-value (choices.py) ------------------------
+
+    def test_schema_for_choices_script_multi_file(self):
+        response = self._get_schema(self.choice_script.script.slug)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+
+        main_parser = data["parsers"][0]
+        params_by_slug = {p["slug"]: p for p in main_parser["parameters"]}
+
+        # --multiple-file-choices: nargs=* file input => multiple_choice
+        mfc = params_by_slug["multiple_file_choices"]
+        self.assertTrue(mfc["multiple_choice"])
+        self.assertTrue(mfc["is_file"])
+        self.assertFalse(mfc["is_output"])
+        self.assertEqual(mfc["form_field"], "FileField")
+        # max_choices is -1 (unbounded) for nargs="*"
+        self.assertEqual(mfc["max_choices"], -1)
+
+        # --more-multiple-file-choices: same semantics
+        mmfc = params_by_slug["more_multiple_file_choices"]
+        self.assertTrue(mmfc["multiple_choice"])
+        self.assertTrue(mmfc["is_file"])
+
+        # --two-choices: nargs=2 integer choices => multiple_choice
+        tc = params_by_slug["two_choices"]
+        self.assertTrue(tc["multiple_choice"])
+        self.assertEqual(tc["max_choices"], 2)
+        self.assertIn(0, tc["choices"])
+
+        # --one-choice: nargs=1 => NOT multiple_choice (max_choices=1)
+        oc = params_by_slug["one_choice"]
+        self.assertFalse(oc["multiple_choice"])
+        self.assertEqual(oc["max_choices"], 1)
+
+        # --need-at-least-one-numbers: nargs=+ required, multiple_choice
+        naln = params_by_slug["need_at_least_one_numbers"]
+        self.assertTrue(naln["required"])
+        self.assertTrue(naln["multiple_choice"])
+        self.assertEqual(naln["max_choices"], -1)
+
+        # --at-least-one-choice: nargs=+ choices, multiple_choice
+        aloc = params_by_slug["at_least_one_choice"]
+        self.assertTrue(aloc["multiple_choice"])
+        self.assertEqual(aloc["max_choices"], -1)
+
+    # -- form_slug includes parser pk ----------------------------------
+
+    def test_form_slug_includes_parser_pk(self):
+        response = self._get_schema(self.subparser_script.script.slug)
+        data = response.json()
+        for parser in data["parsers"]:
+            for param in parser["parameters"]:
+                # form_slug must be "{parser_pk}-{slug}"
+                expected_prefix = "{}-".format(parser["id"])
+                self.assertTrue(
+                    param["form_slug"].startswith(expected_prefix),
+                    "form_slug {} does not start with parser id {}".format(
+                        param["form_slug"], parser["id"]
+                    ),
+                )
+
+    # -- Version filtering ---------------------------------------------
+
+    def test_schema_with_version_filter(self):
+        response = self._get_schema(
+            self.translate_script.script.slug,
+            version=self.translate_script.script_version,
+        )
+        self.assertEqual(response.status_code, 200)
+        sv = response.json()["script_version"]
+        self.assertEqual(sv["script_version"], self.translate_script.script_version)
+
+    def test_schema_with_iteration_filter(self):
+        response = self._get_schema(
+            self.translate_script.script.slug,
+            iteration=self.translate_script.script_iteration,
+        )
+        self.assertEqual(response.status_code, 200)
+        sv = response.json()["script_version"]
+        self.assertEqual(
+            sv["script_iteration"], self.translate_script.script_iteration
+        )
+
+    def test_schema_with_nonexistent_version_returns_404(self):
+        response = self._get_schema(
+            self.translate_script.script.slug, version="999"
+        )
+        self.assertEqual(response.status_code, 404)
+
+    # -- Hidden parameters are excluded --------------------------------
+
+    def test_schema_excludes_hidden_parameters(self):
+        from wooey.models import ScriptParameter
+
+        # Hide one parameter on the translate script
+        param = ScriptParameter.objects.filter(
+            script_version=self.translate_script, slug="frame"
+        ).first()
+        param.hidden = True
+        param.save()
+
+        response = self._get_schema(self.translate_script.script.slug)
+        data = response.json()
+        main_parser = data["parsers"][0]
+        slugs = {p["slug"] for p in main_parser["parameters"]}
+        self.assertNotIn("frame", slugs)

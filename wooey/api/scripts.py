@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import shlex
+from collections import OrderedDict
 from itertools import groupby
 
 from django.http import JsonResponse
@@ -532,3 +533,182 @@ def add_or_update_script(request):
         response.append(output)
 
     return JsonResponse(response, safe=False, encoder=errors.WooeyJSONEncoder)
+
+
+def _serialize_parameter(param):
+    """Convert a ScriptParameter into a machine-consumable dict.
+
+    The returned dict contains every attribute an external client needs
+    to render an input control that is consistent with the server-side
+    form validation performed by ``validate_form`` and
+    ``create_wooey_job``.
+    """
+    choices = json.loads(param.choices) if param.choices else None
+    return OrderedDict(
+        [
+            ("form_slug", param.form_slug),
+            ("script_param", param.script_param),
+            ("short_param", param.short_param or None),
+            ("slug", param.slug),
+            ("form_field", param.form_field),
+            ("input_type", param.input_type),
+            ("required", param.required),
+            ("default", param.default),
+            ("choices", choices),
+            ("choice_limit", json.loads(param.choice_limit) if param.choice_limit else None),
+            ("multiple_choice", param.multiple_choice),
+            ("max_choices", param.max_choices),
+            ("is_output", param.is_output),
+            ("is_file", param.form_field == "FileField" and not param.is_output),
+            ("collapse_arguments", param.collapse_arguments),
+            ("help", param.param_help or ""),
+            ("parameter_group", param.parameter_group.group_name),
+            ("param_order", param.param_order),
+        ]
+    )
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+@requires_login
+def script_schema(request, slug):
+    """Return the structured parameter schema for a script version.
+
+    The response groups non-hidden parameters by parser (main parser
+    first, then sub-parsers in pk order) and preserves the canonical
+    ``param_order`` so that clients can render controls in the same
+    sequence the server expects.
+
+    Query parameters
+    ----------------
+    version : str, optional
+        Select a specific script version string (e.g. ``"1"``).
+    iteration : int, optional
+        Select a specific iteration number.
+
+    When neither is supplied the active default version is used.
+    """
+    script, error = _get_script_or_error(slug)
+    if error:
+        return error
+
+    version = request.GET.get("version")
+    iteration = request.GET.get("iteration")
+
+    qs = models.ScriptVersion.objects.filter(script=script, is_active=True)
+    if not version and not iteration:
+        qs = qs.filter(default_version=True)
+    else:
+        if version:
+            qs = qs.filter(script_version=version)
+        if iteration:
+            try:
+                qs = qs.filter(script_iteration=int(iteration))
+            except (ValueError, TypeError):
+                return JsonResponse(
+                    {
+                        "valid": False,
+                        "errors": {
+                            "iteration": [
+                                force_str(_("iteration must be an integer."))
+                            ]
+                        },
+                    },
+                    status=400,
+                )
+    try:
+        script_version = qs.get()
+    except models.ScriptVersion.DoesNotExist:
+        return JsonResponse(
+            {
+                "valid": False,
+                "errors": {
+                    "script_version": [
+                        force_str(_("Unable to find matching script version."))
+                    ]
+                },
+            },
+            status=404,
+        )
+    except models.ScriptVersion.MultipleObjectsReturned:
+        return JsonResponse(
+            {
+                "valid": False,
+                "errors": {
+                    "script_version": [
+                        force_str(
+                            _(
+                                "Multiple script versions match the given parameters."
+                            )
+                        )
+                    ]
+                },
+            },
+            status=400,
+        )
+
+    valid = utils.valid_user(script_version.script, request.user).get("valid")
+    if not valid:
+        return JsonResponse(
+            {
+                "valid": False,
+                "errors": {
+                    "script": [
+                        force_str(_("You are not permitted to access this script."))
+                    ]
+                },
+            },
+            status=403,
+        )
+
+    # Collect parameters ordered by param_order then pk, same ordering
+    # used by ScriptVersion.get_parameters(), get_master_form() and
+    # create_wooey_job() so the schema is consistent with submission
+    # validation.
+    all_params = list(script_version.get_parameters())
+
+    # Build parser groups: main parser (name="") first, then sub-parsers
+    # in pk order.  Use OrderedDict to guarantee serialisation order.
+    parsers = sorted(
+        script_version.scriptparser_set.all(),
+        key=lambda p: (p.name != "", p.pk),
+    )
+    parser_groups = OrderedDict()
+    for parser in parsers:
+        parser_groups[parser.pk] = {
+            "id": parser.pk,
+            "name": parser.name or None,
+            "is_main": parser.name == "",
+            "parameters": [],
+        }
+
+    for param in all_params:
+        if param.hidden:
+            continue
+        if param.parameter_group.hidden:
+            continue
+        group = parser_groups.get(param.parser_id)
+        if group is None:
+            continue
+        group["parameters"].append(_serialize_parameter(param))
+
+    return JsonResponse(
+        OrderedDict(
+            [
+                ("valid", True),
+                (
+                    "script_version",
+                    OrderedDict(
+                        [
+                            ("id", script_version.id),
+                            ("script_version", script_version.script_version),
+                            ("script_iteration", script_version.script_iteration),
+                            ("is_active", script_version.is_active),
+                            ("default_version", script_version.default_version),
+                        ]
+                    ),
+                ),
+                ("parsers", list(parser_groups.values())),
+            ]
+        )
+    )
