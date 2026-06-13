@@ -1,6 +1,7 @@
 import json
 import os
 from io import BytesIO
+from unittest import mock
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import Client, TransactionTestCase
@@ -65,6 +66,68 @@ class TestJobDetails(
         self.assertIn("url", data["assets"][0])
         self.assertTrue(data["is_complete"])
         self.assertEqual(job.job_name, data["job_name"])
+
+    def test_running_job_returns_live_streamed_output(self):
+        # Regression: while a job runs, its output is streamed to the realtime
+        # cache and the persisted stdout/stderr fields stay empty until it ends.
+        # The details endpoint must surface that live output (as the web view
+        # already does) so external schedulers can show progress.
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.RUNNING
+        job.stdout = ""
+        job.stderr = ""
+        job.save()
+        with mock.patch("wooey.settings.WOOEY_REALTIME_CACHE", "default"):
+            job.update_realtime(stdout="streaming stdout", stderr="streaming stderr")
+            # The persisted columns remain empty mid-run...
+            job.refresh_from_db()
+            self.assertFalse(job.stdout)
+            self.assertFalse(job.stderr)
+            # ...yet the endpoint reports the live output from the cache.
+            response = self.client.get(
+                reverse("wooey:api_job_details", kwargs={"job_id": job.id})
+            )
+            job.update_realtime(delete=True)
+        data = response.json()
+        self.assertFalse(data["is_complete"])
+        self.assertEqual(data["status"], WooeyJob.RUNNING)
+        self.assertEqual(data["stdout"], "streaming stdout")
+        self.assertEqual(data["stderr"], "streaming stderr")
+        # Asset listing stays terminal-only, so a running job exposes none.
+        self.assertEqual(data["assets"], [])
+
+    def test_completed_job_returns_final_output_and_assets(self):
+        # Once terminal the endpoint returns the persisted output plus the
+        # asset list, with permission/asset behaviour unchanged.
+        job = self.create_job_with_output_files()
+        # Persist deterministic final output without a full save(), which would
+        # write back the stale in-memory status and undo the terminal state the
+        # synchronous run recorded.
+        WooeyJob.objects.filter(pk=job.pk).update(
+            stdout="final stdout", stderr="final stderr"
+        )
+        job.refresh_from_db()
+        response = self.client.get(
+            reverse("wooey:api_job_details", kwargs={"job_id": job.id})
+        )
+        data = response.json()
+        self.assertTrue(data["is_complete"])
+        self.assertEqual(data["stdout"], "final stdout")
+        self.assertEqual(data["stderr"], "final stderr")
+        self.assertIn("url", data["assets"][0])
+        self.assertEqual(job.job_name, data["job_name"])
+
+    def test_details_forbidden_for_other_users_job(self):
+        # Permission semantics are unchanged: another user's job is hidden.
+        another_user = factories.UserFactory(username="bob")
+        job = factories.generate_job(self.translate_script)
+        job.user = another_user
+        job.save()
+        response = self.client.get(
+            reverse("wooey:api_job_details", kwargs={"job_id": job.id})
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.json()["valid"])
 
 
 class TestScriptAddition(mixins.ScriptFactoryMixin, ApiTestMixin, TransactionTestCase):

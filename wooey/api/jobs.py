@@ -59,8 +59,11 @@ def job_details(request, job_id):
                 "uuid": job.uuid,
                 "job_name": job.job_name,
                 "job_description": job.job_description,
-                "stdout": job.stdout,
-                "stderr": job.stderr,
+                # Use the real-time accessors (not the raw fields) so running
+                # jobs surface the latest streamed output instead of waiting for
+                # the persisted stdout/stderr that only land once the job ends.
+                "stdout": job.get_stdout(),
+                "stderr": job.get_stderr(),
                 "assets": assets,
             }
         )
