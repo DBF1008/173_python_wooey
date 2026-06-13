@@ -84,13 +84,9 @@ def get_latest_script(script_version):
         script_contents = local_storage.open(script_path.name).read()
         script_checksum = utils.get_checksum(buff=script_contents)
         if script_checksum != script_version.checksum:
-            tf = tempfile.TemporaryFile()
-            with tf:
-                tf.write(script_contents)
-                tf.seek(0)
-                local_storage.delete(script_path.name)
-                local_storage.save(script_path.name, tf)
-                return True
+            local_storage.delete(script_path.name)
+            local_storage.save(script_path.name, script_path.file)
+            return True
     return False
 
 

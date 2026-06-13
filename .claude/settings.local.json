@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import wooey; print\\(''''wooey installed''''\\)\")",
+      "Bash(pip3 show:*)",
+      "Bash(DJANGO_SETTINGS_MODULE=wooey.test_settings python3 -m pytest wooey/tests/test_tasks.py -v)"
+    ]
+  }
+}
