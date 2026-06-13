@@ -1,4 +1,5 @@
 from .jobs import (  # noqa: F401
+    job_command,
     job_details,
     job_status,
 )

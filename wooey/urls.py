@@ -105,6 +105,11 @@ wooey_patterns = [
         name="api_job_details",
     ),
     re_path(
+        r"^api/jobs/v1/(?P<job_id>[a-zA-Z0-9\-\_]+)/command/$",
+        api.job_command,
+        name="api_job_command",
+    ),
+    re_path(
         r"^scripts/(?P<slug>[a-zA-Z0-9\-\_]+)/$",
         views.WooeyScriptView.as_view(),
         name="wooey_script",

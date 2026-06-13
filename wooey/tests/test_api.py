@@ -1,9 +1,11 @@
 import json
 import os
 from io import BytesIO
+from unittest import mock
 
+from celery import states
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import Client, TransactionTestCase
+from django.test import Client, TestCase, TransactionTestCase
 from django.urls import reverse
 
 from .. import models
@@ -65,6 +67,116 @@ class TestJobDetails(
         self.assertIn("url", data["assets"][0])
         self.assertTrue(data["is_complete"])
         self.assertEqual(job.job_name, data["job_name"])
+
+
+class TestJobCommands(mixins.ScriptFactoryMixin, ApiTestMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.owner = self.api_key.profile.user
+
+    def _make_job(self, status=WooeyJob.COMPLETED, user=True):
+        job = factories.generate_job(self.translate_script)
+        job.user = self.owner if user is True else user
+        job.status = status
+        job.save()
+        return job
+
+    def _command(self, job_id, command):
+        return self.client.post(
+            reverse("wooey:api_job_command", kwargs={"job_id": job_id}),
+            data=json.dumps({"command": command}),
+            content_type="application/json",
+        )
+
+    def test_unauthorized_user_cannot_operate(self):
+        other_user = factories.UserFactory(username="bob")
+        job = self._make_job(status=WooeyJob.COMPLETED, user=other_user)
+        response = self._command(job.id, "delete")
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.json()["valid"])
+        job.refresh_from_db()
+        self.assertEqual(job.status, WooeyJob.COMPLETED)
+
+    @mock.patch("wooey.api.jobs.celery_app")
+    def test_stop_running_job(self, mock_celery):
+        job = self._make_job(status=WooeyJob.RUNNING)
+        response = self._command(job.id, "stop")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+        self.assertEqual(data["status"], states.REVOKED)
+        self.assertTrue(mock_celery.control.revoke.called)
+        job.refresh_from_db()
+        self.assertEqual(job.status, states.REVOKED)
+
+    def test_cannot_stop_completed_job(self):
+        job = self._make_job(status=WooeyJob.COMPLETED)
+        response = self._command(job.id, "stop")
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.json()["valid"])
+        job.refresh_from_db()
+        self.assertEqual(job.status, WooeyJob.COMPLETED)
+
+    def test_rerun_completed_job(self):
+        job = self._make_job(status=WooeyJob.COMPLETED)
+        response = self._command(job.id, "rerun")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["job_id"], job.id)
+        self.assertEqual(data["status"], WooeyJob.SUBMITTED)
+        job.refresh_from_db()
+        self.assertEqual(job.status, WooeyJob.SUBMITTED)
+
+    def test_resubmit_creates_new_job(self):
+        job = self._make_job(status=WooeyJob.COMPLETED)
+        response = self._command(job.id, "resubmit")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+        self.assertNotEqual(data["job_id"], job.id)
+        self.assertEqual(data["original_job_id"], job.id)
+        self.assertEqual(data["status"], WooeyJob.SUBMITTED)
+        new_job = WooeyJob.objects.get(id=data["job_id"])
+        self.assertEqual(new_job.user, self.owner)
+        # the original job is untouched
+        job.refresh_from_db()
+        self.assertEqual(job.status, WooeyJob.COMPLETED)
+
+    def test_delete_job(self):
+        job = self._make_job(status=WooeyJob.COMPLETED)
+        response = self._command(job.id, "delete")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+        self.assertEqual(data["status"], WooeyJob.DELETED)
+        job.refresh_from_db()
+        self.assertEqual(job.status, WooeyJob.DELETED)
+
+    def test_can_operate_on_anonymous_job(self):
+        job = self._make_job(status=WooeyJob.COMPLETED, user=None)
+        response = self._command(job.id, "delete")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["valid"])
+
+    def test_unknown_command_is_rejected(self):
+        job = self._make_job(status=WooeyJob.COMPLETED)
+        response = self._command(job.id, "explode")
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.json()["valid"])
+
+    def test_missing_job_returns_404(self):
+        response = self._command("999999", "delete")
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(response.json()["valid"])
+
+    def test_command_requires_authentication(self):
+        job = self._make_job(status=WooeyJob.COMPLETED)
+        response = Client().post(
+            reverse("wooey:api_job_command", kwargs={"job_id": job.id}),
+            data=json.dumps({"command": "delete"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 403)
 
 
 class TestScriptAddition(mixins.ScriptFactoryMixin, ApiTestMixin, TransactionTestCase):
