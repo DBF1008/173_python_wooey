@@ -66,6 +66,29 @@ def configure_workers(*args, **kwargs):
     django.setup()
 
 
+def _download_script_to_local(script_version):
+    """Fetch the authoritative script from the default (remote) storage and
+    (re)write it into the local storage.
+
+    Worker nodes execute the *local* copy of a script (see
+    ``ScriptVersion.get_script_path``), so the local copy must always match the
+    code referenced by ``script_version``. The remote copy is read fully before
+    the local cache is mutated so we never destroy the only copy when the local
+    and remote storages share a backend (non-ephemeral deployments).
+    """
+    script_path = script_version.script_path
+    local_storage = utils.get_storage(local=True)
+    remote_storage = utils.get_storage(local=False)
+    with remote_storage.open(script_path.name) as remote_file:
+        contents = remote_file.read()
+    if local_storage.exists(script_path.name):
+        local_storage.delete(script_path.name)
+    with tempfile.TemporaryFile() as tf:
+        tf.write(contents)
+        tf.seek(0)
+        local_storage.save(script_path.name, tf)
+
+
 def get_latest_script(script_version):
     """Downloads the latest script version to the local storage.
 
@@ -77,20 +100,20 @@ def get_latest_script(script_version):
     local_storage = utils.get_storage(local=True)
     script_exists = local_storage.exists(script_path.name)
     if not script_exists:
-        local_storage.save(script_path.name, script_path.file)
+        # First pull on this node: there is no local copy yet, fetch it.
+        _download_script_to_local(script_version)
         return True
-    else:
-        # If script exists, make sure the version is valid, otherwise fetch a new one
-        script_contents = local_storage.open(script_path.name).read()
-        script_checksum = utils.get_checksum(buff=script_contents)
-        if script_checksum != script_version.checksum:
-            tf = tempfile.TemporaryFile()
-            with tf:
-                tf.write(script_contents)
-                tf.seek(0)
-                local_storage.delete(script_path.name)
-                local_storage.save(script_path.name, tf)
-                return True
+
+    # The script exists locally. Make sure the cached copy matches the expected
+    # checksum. If it does not -- because a new version was published and the
+    # cache is stale, or because the cached file was corrupted -- re-download the
+    # authoritative copy from the remote storage instead of re-saving the bad
+    # local bytes (which previously left the worker executing outdated code).
+    script_contents = local_storage.open(script_path.name).read()
+    script_checksum = utils.get_checksum(buff=script_contents)
+    if script_checksum != script_version.checksum:
+        _download_script_to_local(script_version)
+        return True
     return False
 
 
