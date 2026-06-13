@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 from io import BytesIO
@@ -7,6 +8,7 @@ from django.test import Client, TransactionTestCase
 from django.urls import reverse
 
 from .. import models
+from ..api.scripts import create_argparser
 from ..models import WooeyJob
 from . import factories, mixins
 
@@ -782,3 +784,190 @@ class TestScriptSubmission(
             ),
             [1, 2, 3],
         )
+
+
+class TestScriptParameters(
+    mixins.ScriptFactoryMixin, ApiTestMixin, TransactionTestCase
+):
+    def _get_schema(self, script_version, **params):
+        return self.client.get(
+            reverse(
+                "wooey:api_script_parameters",
+                kwargs={"slug": script_version.script.slug},
+            ),
+            data=params,
+        )
+
+    @staticmethod
+    def _parser_block(data, name):
+        return next(block for block in data["parsers"] if block["name"] == name)
+
+    @staticmethod
+    def _by_flag(parser_block):
+        return {param["short_param"]: param for param in parser_block["parameters"]}
+
+    def _assert_consistent_with_submission(self, script_version, data):
+        """The schema must describe exactly the arguments that submission accepts.
+
+        ``create_argparser`` is the parser used by ``submit_script`` to validate a
+        submitted command. It is a separate code path from the schema endpoint, so
+        comparing the two guarantees the schema stays in sync with submission.
+        """
+        parser = create_argparser(script_version)
+        base_dests = {action.dest for action in parser._actions} - {
+            "help",
+            "wooey_subparser",
+        }
+        subparser_dests = {}
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for name, subparser in action.choices.items():
+                    subparser_dests[name] = {
+                        sub_action.dest for sub_action in subparser._actions
+                    } - {"help"}
+
+        schema_by_name = {
+            block["name"]: {param["form_slug"] for param in block["parameters"]}
+            for block in data["parsers"]
+        }
+        self.assertEqual(schema_by_name.get("", set()), base_dests)
+        for name, dests in subparser_dests.items():
+            self.assertEqual(schema_by_name.get(name), dests)
+
+        for block in data["parsers"]:
+            # Parameters within a parser are returned in declared order.
+            orders = [param["param_order"] for param in block["parameters"]]
+            self.assertEqual(orders, sorted(orders))
+            # form_slug is the key submission consumes: <parser_id>-<slug>.
+            for param in block["parameters"]:
+                self.assertEqual(
+                    param["form_slug"],
+                    "{}-{}".format(block["id"], param["slug"]),
+                )
+
+    def test_requires_authentication(self):
+        response = Client().get(
+            reverse(
+                "wooey:api_script_parameters",
+                kwargs={"slug": self.translate_script.script.slug},
+            )
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.json()["valid"])
+
+    def test_missing_script_returns_404(self):
+        response = self.client.get(
+            reverse("wooey:api_script_parameters", kwargs={"slug": "does-not-exist"})
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(response.json()["valid"])
+
+    def test_script_without_arguments_returns_single_empty_parser(self):
+        response = self._get_schema(self.without_args)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+        self.assertEqual(len(data["parsers"]), 1)
+        self.assertEqual(data["parsers"][0]["name"], "")
+        self.assertEqual(data["parsers"][0]["parameters"], [])
+        self._assert_consistent_with_submission(self.without_args, data)
+
+    def test_reports_defaults_choices_and_file_semantics(self):
+        response = self._get_schema(self.translate_script)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+        # A script without subparsers exposes only the (unnamed) main parser.
+        self.assertEqual([block["name"] for block in data["parsers"]], [""])
+        params = self._by_flag(data["parsers"][0])
+
+        frame = params["--frame"]
+        self.assertEqual(frame["choices"], ["+1", "+2", "+3", "-1", "-2", "-3"])
+        self.assertEqual(frame["default"], "+1")
+        self.assertFalse(frame["is_file"])
+        self.assertFalse(frame["multiple"])
+
+        # An input file must be uploaded by the client.
+        fasta = params["--fasta"]
+        self.assertTrue(fasta["is_file"])
+        self.assertFalse(fasta["is_output"])
+
+        # An output file is provided as a name, not an upload.
+        out = params["--out"]
+        self.assertTrue(out["is_file"])
+        self.assertTrue(out["is_output"])
+
+        sequence = params["--sequence"]
+        self.assertFalse(sequence["is_file"])
+        self.assertIsNone(sequence["choices"])
+
+        self._assert_consistent_with_submission(self.translate_script, data)
+
+    def test_reports_subparsers(self):
+        response = self._get_schema(self.subparser_script)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+
+        names = {block["name"] for block in data["parsers"]}
+        self.assertEqual(names, {"", "subparser1", "subparser2"})
+        # The main parser is always listed first.
+        self.assertEqual(data["parsers"][0]["name"], "")
+
+        main = self._by_flag(self._parser_block(data, ""))
+        self.assertIn("--test-arg", main)
+        self.assertFalse(main["--test-arg"]["is_file"])
+
+        subparser1 = self._by_flag(self._parser_block(data, "subparser1"))
+        self.assertIn("--sp1", subparser1)
+        self.assertTrue(subparser1["--sp1"]["required"])
+
+        subparser2 = self._by_flag(self._parser_block(data, "subparser2"))
+        self.assertIn("--sp2", subparser2)
+
+        self._assert_consistent_with_submission(self.subparser_script, data)
+
+    def test_reports_multi_value_and_file_parameters(self):
+        response = self._get_schema(self.choice_script)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["valid"])
+        params = self._by_flag(self._parser_block(data, ""))
+
+        multiple_files = params["--multiple-file-choices"]
+        self.assertTrue(multiple_files["is_file"])
+        self.assertTrue(multiple_files["multiple"])
+        self.assertFalse(multiple_files["is_output"])
+
+        numbers = params["--need-at-least-one-numbers"]
+        self.assertTrue(numbers["required"])
+        self.assertTrue(numbers["multiple"])
+        self.assertFalse(numbers["is_file"])
+
+        one_choice = params["--one-choice"]
+        self.assertEqual(one_choice["choices"], [0, 1, 2, 3])
+
+        self._assert_consistent_with_submission(self.choice_script, data)
+
+    def test_can_select_specific_version(self):
+        slug = self.version1_script.script.slug
+
+        default_data = self._get_schema(self.version1_script).json()
+        self.assertEqual(default_data["script"]["version"]["script_iteration"], 2)
+        default_flags = {
+            param["short_param"]
+            for param in self._parser_block(default_data, "")["parameters"]
+        }
+        self.assertEqual(default_flags, {"--one", "--two"})
+
+        v1_response = self.client.get(
+            reverse("wooey:api_script_parameters", kwargs={"slug": slug}),
+            data={"iteration": 1},
+        )
+        v1_data = v1_response.json()
+        self.assertEqual(v1_data["script"]["version"]["script_iteration"], 1)
+        v1_flags = {
+            param["short_param"]
+            for param in self._parser_block(v1_data, "")["parameters"]
+        }
+        self.assertEqual(v1_flags, {"--one"})

@@ -55,6 +55,11 @@ wooey_patterns = [
         name="api_submit_script",
     ),
     re_path(
+        r"^api/scripts/v1/(?P<slug>[a-zA-Z0-9\-\_]+)/parameters/$",
+        api.script_parameters,
+        name="api_script_parameters",
+    ),
+    re_path(
         r"^api/scripts/v1/add-or-update/$",
         api.add_or_update_script,
         name="api_add_or_update_script",

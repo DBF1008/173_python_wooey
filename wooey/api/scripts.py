@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import shlex
+from collections import defaultdict
 from itertools import groupby
 
 from django.http import JsonResponse
@@ -106,6 +107,38 @@ def _serialize_script_version(script_version):
         "created_by": _serialize_user(script_version.created_by),
         "modified_date": script_version.modified_date,
         "modified_by": _serialize_user(script_version.modified_by),
+    }
+
+
+def _serialize_parameter(param):
+    """Serialize a single ScriptParameter into a machine-consumable schema entry.
+
+    The ``form_slug`` is the key used both by the submission argument parser
+    (as the argparse ``dest``) and by the submission form, so a client can build
+    a command/payload directly from this schema and have it pass the same
+    validation used by ``submit_script``.
+    """
+    is_file = param.form_field == models.ScriptParameters.FILE
+    return {
+        "name": param.script_param,
+        "slug": param.slug,
+        "form_slug": param.form_slug,
+        "param_order": param.param_order,
+        "short_param": param.short_param,
+        "required": param.required,
+        "default": param.default,
+        "choices": json.loads(param.choices) if param.choices else None,
+        "multiple": param.multiple_choice,
+        "max_choices": param.max_choices,
+        "is_file": is_file,
+        # is_output is only meaningful for file parameters; output files are sent
+        # as a filename string rather than an uploaded file.
+        "is_output": bool(is_file and param.is_output),
+        "form_field": param.form_field,
+        "param_type": param.input_type,
+        "help": param.param_help or "",
+        "hidden": param.hidden,
+        "group": param.parameter_group.group_name,
     }
 
 
@@ -250,6 +283,111 @@ def script_detail(request, slug):
         return error
 
     return JsonResponse({"valid": True, "script": _serialize_script(script, True)})
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+@requires_login
+def script_parameters(request, slug):
+    """Return a structured, machine-consumable schema of a script's parameters.
+
+    This lets external clients build their own submission UI without scraping the
+    rendered form HTML. The schema covers the main parser and any subparsers,
+    parameter order, defaults, required status, choices, and file/multi-value
+    semantics. Parameters are derived from the same ``ScriptVersion.get_parameters``
+    used by ``submit_script``'s argument parser, so the reported ``form_slug``s are
+    exactly the keys accepted by submission.
+    """
+    script, error = _get_script_or_error(slug)
+    if error:
+        return error
+
+    version = request.GET.get("version")
+    iteration = request.GET.get("iteration")
+    versions = models.ScriptVersion.objects.filter(script=script, is_active=True)
+    if not version and not iteration:
+        versions = versions.filter(default_version=True)
+    else:
+        if version:
+            versions = versions.filter(script_version=version)
+        if iteration:
+            versions = versions.filter(script_iteration=iteration)
+    try:
+        script_version = versions.get()
+    except (
+        models.ScriptVersion.DoesNotExist,
+        models.ScriptVersion.MultipleObjectsReturned,
+    ):
+        return JsonResponse(
+            {
+                "valid": False,
+                "errors": {
+                    "script": [force_str(_("Unable to find script version."))]
+                },
+            },
+            status=404,
+        )
+
+    # Mirror submit_script's permission model so the schema is visible exactly when
+    # the script can be submitted.
+    user = request.user
+    script_valid = utils.valid_user(script, user)["valid"]
+    group_valid = (
+        utils.valid_user(script.script_group, user)["valid"]
+        if script.script_group
+        else True
+    )
+    if not (script_valid and group_valid):
+        return JsonResponse(
+            {
+                "valid": False,
+                "errors": {
+                    "script": [
+                        force_str(_("You are not permitted to access this script."))
+                    ]
+                },
+            },
+            status=403,
+        )
+
+    parameters = list(script_version.get_parameters())
+    params_by_parser = defaultdict(list)
+    for parameter in parameters:
+        params_by_parser[parameter.parser_id].append(parameter)
+
+    # The main parser has an empty name; list it first, then subparsers by pk so
+    # the ordering is deterministic for clients.
+    parsers = sorted(
+        script_version.scriptparser_set.all(),
+        key=lambda parser: (parser.name != "", parser.pk),
+    )
+    serialized_parsers = [
+        {
+            "name": parser.name,
+            "id": parser.id,
+            "parameters": [
+                _serialize_parameter(parameter)
+                for parameter in params_by_parser.get(parser.id, [])
+            ],
+        }
+        for parser in parsers
+    ]
+
+    return JsonResponse(
+        {
+            "valid": True,
+            "script": {
+                "slug": script.slug,
+                "script_name": script.script_name,
+                "version": {
+                    "id": script_version.id,
+                    "script_version": script_version.script_version,
+                    "script_iteration": script_version.script_iteration,
+                },
+            },
+            "parsers": serialized_parsers,
+        }
+    )
 
 
 @csrf_exempt
