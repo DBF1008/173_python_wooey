@@ -59,8 +59,8 @@ def job_details(request, job_id):
                 "uuid": job.uuid,
                 "job_name": job.job_name,
                 "job_description": job.job_description,
-                "stdout": job.stdout,
-                "stderr": job.stderr,
+                "stdout": job.get_stdout(),
+                "stderr": job.get_stderr(),
                 "assets": assets,
             }
         )

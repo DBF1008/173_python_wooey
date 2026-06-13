@@ -1,6 +1,7 @@
 import json
 import os
 from io import BytesIO
+from unittest import mock
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import Client, TransactionTestCase
@@ -65,6 +66,91 @@ class TestJobDetails(
         self.assertIn("url", data["assets"][0])
         self.assertTrue(data["is_complete"])
         self.assertEqual(job.job_name, data["job_name"])
+
+    def test_running_job_returns_realtime_stdout_stderr_without_cache(self):
+        # When WOOEY_REALTIME_CACHE is None, update_realtime writes directly to DB
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.RUNNING
+        job.save()
+
+        # Simulate realtime output during execution
+        job.update_realtime(stdout="running output", stderr="running error")
+
+        response = self.client.get(
+            reverse("wooey:api_job_details", kwargs={"job_id": job.id})
+        )
+        data = response.json()
+
+        self.assertEqual(data["status"], WooeyJob.RUNNING)
+        self.assertFalse(data["is_complete"])
+        self.assertEqual(data["stdout"], "running output")
+        self.assertEqual(data["stderr"], "running error")
+        self.assertEqual(data["assets"], [])
+
+    def test_running_job_returns_realtime_stdout_stderr_with_cache(self):
+        # When WOOEY_REALTIME_CACHE is configured, update_realtime writes to cache
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.RUNNING
+        job.stdout = ""
+        job.stderr = ""
+        job.save()
+
+        with mock.patch("wooey.models.core.wooey_settings.WOOEY_REALTIME_CACHE", "default"):
+            # Write realtime output to cache
+            job.update_realtime(stdout="cached output", stderr="cached error")
+
+            # Verify DB fields are still empty
+            job.refresh_from_db()
+            self.assertEqual(job.stdout, "")
+            self.assertEqual(job.stderr, "")
+
+            # API should return cached values
+            response = self.client.get(
+                reverse("wooey:api_job_details", kwargs={"job_id": job.id})
+            )
+            data = response.json()
+
+            self.assertEqual(data["status"], WooeyJob.RUNNING)
+            self.assertFalse(data["is_complete"])
+            self.assertEqual(data["stdout"], "cached output")
+            self.assertEqual(data["stderr"], "cached error")
+
+    def test_completed_job_returns_final_stdout_stderr(self):
+        # Completed jobs should always return DB values, not cache
+        job = factories.generate_job(self.translate_script)
+        job.status = WooeyJob.COMPLETED
+        job.stdout = "final output"
+        job.stderr = "final error"
+        job.save()
+
+        # Even if cache has stale data, completed jobs return DB values
+        with mock.patch("wooey.models.core.wooey_settings.WOOEY_REALTIME_CACHE", "default"):
+            job.update_realtime(stdout="stale cached output", stderr="stale cached error")
+
+            response = self.client.get(
+                reverse("wooey:api_job_details", kwargs={"job_id": job.id})
+            )
+            data = response.json()
+
+            self.assertEqual(data["status"], WooeyJob.COMPLETED)
+            self.assertTrue(data["is_complete"])
+            self.assertEqual(data["stdout"], "final output")
+            self.assertEqual(data["stderr"], "final error")
+
+    def test_unauthorized_user_cannot_access_job_details(self):
+        another_user = factories.UserFactory(username="bob")
+        job = factories.generate_job(self.translate_script)
+        job.user = another_user
+        job.save()
+
+        response = self.client.get(
+            reverse("wooey:api_job_details", kwargs={"job_id": job.id})
+        )
+
+        self.assertEqual(response.status_code, 403)
+        data = response.json()
+        self.assertFalse(data["valid"])
+        self.assertIn("not permitted", data["errors"]["__all__"][0].lower())
 
 
 class TestScriptAddition(mixins.ScriptFactoryMixin, ApiTestMixin, TransactionTestCase):
